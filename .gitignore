@@ -1,0 +1,30 @@
+# Restricted primary empirical data
+data/model_space.mat
+model_space.mat
+
+# Manuscript and LaTeX build files (managed separately from code repository)
+manuscript/
+*.tex
+*.bib
+*.pdf
+*.aux
+*.bbl
+*.blg
+*.log
+*.out
+*.spl
+*.synctex.gz
+
+# Legacy development archive
+_legacy_archive/
+external_timeseries_40.npy
+
+# Python & OS artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.env
+.DS_Store
+Thumbs.db
