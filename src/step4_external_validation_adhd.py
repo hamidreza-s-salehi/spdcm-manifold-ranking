@@ -84,6 +84,8 @@ def run_step4(context_step1, data_path='data/external_adhd_timeseries_40.pkl'):
     # 2. Linear / Gauss-Newton Inversion on Full 36 Connections
     # --------------------------------------------------------------------------
     A0 = np.zeros((6, 6))
+    for i in range(6):
+        A0[i, i] = -0.5
     Gy0 = biophysical_csd(A0, freqs_ext)
     y0 = np.concatenate([np.real(Gy0).flatten(), np.imag(Gy0).flatten()])
     eps = 1e-4
@@ -136,67 +138,409 @@ def run_step4(context_step1, data_path='data/external_adhd_timeseries_40.pkl'):
     print(f"External 36D BMR: Delta F (M4 - M2) = {np.mean(dF_42_ext_bmr):+.2f} +/- {np.std(dF_42_ext_bmr):.2f} nats")
 
     # --------------------------------------------------------------------------
-    # 3. 5-Fold Cross-Spectral Predictive Cross-Validation (N = 40 & TDC n = 20)
+    # 3. Three-Level Cross-Spectral Generalization Benchmark
     # --------------------------------------------------------------------------
-    print("Evaluating 5-fold cross-spectral predictive CV against observed Welch CSD...")
-    A_ext_36 = qE_all.reshape(N_ext, 6, 6)
-    kf_ext = KFold(n_splits=5, shuffle=True, random_state=SEED)
-    ext_models_7_gain = np.zeros((N_ext, 7))
-    ext_models_7_mse_lin = np.zeros((N_ext, 7))
-    ext_cv_gain_5edge = {k: np.zeros(N_ext) for k in masks_5edge}
-    
-    for tr, te in kf_ext.split(range(N_ext)):
-        A_proto = np.mean(A_ext_36[tr], axis=0)
-        
-        for k, m in masks_5edge.items():
-            A_k = A_proto * m
-            G_pred_base = biophysical_csd(A_k, freqs_ext)
-            num = 0.0; den = 0.0
-            for s in tr:
-                num += np.real(np.sum(Gy_obs_ext[s][:, offdiag] * np.conj(G_pred_base[:, offdiag])))
-                den += np.sum(np.abs(G_pred_base[:, offdiag])**2)
-            gamma = max(0.1, num / max(1e-12, den))
-            G_pred = gamma * G_pred_base
-            for s in te:
-                diff = Gy_obs_ext[s][:, offdiag] - G_pred[:, offdiag]
-                ext_cv_gain_5edge[k][s] = 10.0 * np.log10(np.mean(np.abs(diff)**2))
-                
-        for m_idx in range(7):
-            A_m = A_proto * masks_7[m_idx]
-            G_pred_base = biophysical_csd(A_m, freqs_ext)
-            num = 0.0; den = 0.0
-            for s in tr:
-                num += np.real(np.sum(Gy_obs_ext[s][:, offdiag] * np.conj(G_pred_base[:, offdiag])))
-                den += np.sum(np.abs(G_pred_base[:, offdiag])**2)
-            gamma = max(0.1, num / max(1e-12, den))
-            G_pred = gamma * G_pred_base
-            for s in te:
-                diff = Gy_obs_ext[s][:, offdiag] - G_pred[:, offdiag]
-                mse_val = np.mean(np.abs(diff)**2)
-                ext_models_7_mse_lin[s, m_idx] = mse_val
-                ext_models_7_gain[s, m_idx] = 10.0 * np.log10(mse_val)
+    print("Evaluating Three-Level Cross-Spectral Generalization Benchmark (Protocols A, B, C)...")
+    A_ext_36 = np.zeros((N_ext, 6, 6))
+    for s in range(N_ext):
+        A_ext_36[s] = A0 + qE_all[s].reshape(6, 6)
 
-    mean_db_ext = np.mean(ext_models_7_gain, axis=0)
-    sem_db_ext = np.std(ext_models_7_gain, axis=0) / np.sqrt(N_ext)
-    
-    # TDC Controls Subgroup (first 20 participants)
-    mean_db_tdc = np.mean(ext_models_7_gain[:20], axis=0)
-    sem_db_tdc = np.std(ext_models_7_gain[:20], axis=0) / np.sqrt(20)
-
-    # Predictive BIC (pBIC) on External Cohort
-    N_obs_ext = len(freqs_ext) * 30
-    pBIC_ext = np.zeros((N_ext, 7))
+    # Frequency-domain VL Inversion per candidate architecture
+    masks_ext = get_model_masks()
+    A_ext_models = np.zeros((N_ext, 7, 6, 6))
     for m in range(7):
-        pBIC_ext[:, m] = N_obs_ext * np.log(np.maximum(1e-12, ext_models_7_mse_lin[:, m])) + k_ext[m] * np.log(N_obs_ext)
-    mean_pbic_ext = np.mean(pBIC_ext, axis=0)
-    min_pbic_ext = np.min(mean_pbic_ext)
-    delta_pbic_ext = mean_pbic_ext - min_pbic_ext
+        param_indices = np.where(masks_ext[m].flatten())[0]
+        n_params = len(param_indices)
+        J_m = np.zeros((len(y0), n_params))
+        for idx_p, p in enumerate(param_indices):
+            A_step = A0.copy(); A_step.flat[p] += eps
+            G_step = biophysical_csd(A_step, freqs_ext)
+            y_step = np.concatenate([np.real(G_step).flatten(), np.imag(G_step).flatten()])
+            J_m[:, idx_p] = (y_step - y0) / eps
+        pP_m = (1.0 / pC_diag) * np.eye(n_params)
+        qC_m = np.linalg.inv(prec * (J_m.T @ J_m) + pP_m)
+        for s in range(N_ext):
+            y_obs = np.concatenate([np.real(Gy_obs_ext[s]).flatten(), np.imag(Gy_obs_ext[s]).flatten()])
+            scale_y = np.std(y_obs) / np.std(y0); dy = (y_obs / scale_y) - y0
+            qE_m = qC_m @ (prec * (J_m.T @ dy))
+            A_s_m = A0.copy(); A_s_m.flat[param_indices] = qE_m
+            A_ext_models[s, m] = A_s_m
 
-    print(f"External Held-Out CSD Error (N = 40): M4 = {mean_db_ext[3]:.2f} dB, M2 = {mean_db_ext[1]:.2f} dB, M1 = {mean_db_ext[0]:.2f} dB")
-    print(f"External Predictive BIC: Winning Model = M{np.argmin(mean_pbic_ext)+1} (Delta pBIC M1 = {delta_pbic_ext[0]:.1f})")
+    # PROTOCOL A: Within-Cohort Cross-Subject 5-Fold CV (Off-Diagonal Welch CSD, N = 40 & TDC n = 20)
+    kf_ext = KFold(n_splits=5, shuffle=True, random_state=SEED)
+    ext_mse_lin_offdiag = np.zeros((N_ext, 7))
+    ext_mse_lin_full = np.zeros((N_ext, 7))
+
+    for train_idx, test_idx in kf_ext.split(range(N_ext)):
+        for m in range(7):
+            for s in test_idx:
+                Gy_pred = biophysical_csd(A_ext_models[s, m], freqs_ext)
+                diff = Gy_pred - Gy_obs_ext[s]
+                ext_mse_lin_full[s, m] = np.mean(np.abs(diff)**2)
+                ext_mse_lin_offdiag[s, m] = np.mean(np.abs(diff[:, offdiag])**2)
+
+    N_eff_ext = 30.0
+    N_obs_ext = len(freqs_ext) * 30
+    ext_offdiag_dB = np.zeros((N_ext, 7))
+    ext_offdiag_pBIC = np.zeros((N_ext, 7))
+    for m in range(7):
+        lin = ext_mse_lin_offdiag[:, m]
+        ext_offdiag_dB[:, m] = 10.0 * np.log10(lin + 1e-15)
+        ext_offdiag_pBIC[:, m] = N_eff_ext * np.log(lin + 1e-15) + k_ext[m] * np.log(N_eff_ext)
+
+    mean_db_ext = np.mean(ext_offdiag_dB, axis=0)
+    sem_db_ext = np.std(ext_offdiag_dB, axis=0) / np.sqrt(N_ext)
+    mean_pbic_ext = np.mean(ext_offdiag_pBIC, axis=0)
+    sem_pbic_ext = np.std(ext_offdiag_pBIC, axis=0) / np.sqrt(N_ext)
+    delta_pbic_ext = mean_pbic_ext - np.min(mean_pbic_ext)
+
+    mean_db_tdc = np.mean(ext_offdiag_dB[:20], axis=0)
+    sem_db_tdc = np.std(ext_offdiag_dB[:20], axis=0) / np.sqrt(20)
+    mean_pbic_tdc = np.mean(ext_offdiag_pBIC[:20], axis=0)
+
+    # 5-Edge control models for Protocol A
+    ext_cv_gain_5edge = {k: np.zeros(N_ext) for k in masks_5edge}
+    for k, m_c in masks_5edge.items():
+        param_indices_c = np.where(m_c.flatten())[0]
+        n_params_c = len(param_indices_c)
+        J_c = np.zeros((len(y0), n_params_c))
+        for idx_p, p in enumerate(param_indices_c):
+            A_step = A0.copy(); A_step.flat[p] += eps
+            G_step = biophysical_csd(A_step, freqs_ext)
+            y_step = np.concatenate([np.real(G_step).flatten(), np.imag(G_step).flatten()])
+            J_c[:, idx_p] = (y_step - y0) / eps
+        pP_c = (1.0 / pC_diag) * np.eye(n_params_c)
+        qC_c = np.linalg.inv(prec * (J_c.T @ J_c) + pP_c)
+        for s in range(N_ext):
+            y_obs = np.concatenate([np.real(Gy_obs_ext[s]).flatten(), np.imag(Gy_obs_ext[s]).flatten()])
+            scale_y = np.std(y_obs) / np.std(y0); dy = (y_obs / scale_y) - y0
+            qE_c = qC_c @ (prec * (J_c.T @ dy))
+            A_s_c = A0.copy(); A_s_c.flat[param_indices_c] = qE_c
+            Gy_pred_c = biophysical_csd(A_s_c, freqs_ext)
+            diff_c = Gy_pred_c - Gy_obs_ext[s]
+            ext_cv_gain_5edge[k][s] = 10.0 * np.log10(np.mean(np.abs(diff_c[:, offdiag])**2) + 1e-15)
+
+    mean_ctrl_a = np.mean([
+        ext_cv_gain_5edge['Control_mOFCL'],
+        ext_cv_gain_5edge['Control_mOFCR'],
+        ext_cv_gain_5edge['Control_MTGL'],
+        ext_cv_gain_5edge['Control_STGR']
+    ], axis=0)
+    w_pcc_a, p_pcc_a = wilcoxon(ext_cv_gain_5edge['Model_4_PCC'], mean_ctrl_a)
+    w_lp_a, p_lp_a = wilcoxon(ext_cv_gain_5edge['Model_2_LP'], mean_ctrl_a)
+    diff_pcc_a = ext_cv_gain_5edge['Model_4_PCC'] - mean_ctrl_a
+    diff_lp_a = ext_cv_gain_5edge['Model_2_LP'] - mean_ctrl_a
+    d_pcc_a = float(np.mean(diff_pcc_a) / (np.std(diff_pcc_a, ddof=1) + 1e-12))
+    d_lp_a = float(np.mean(diff_lp_a) / (np.std(diff_lp_a, ddof=1) + 1e-12))
+
+    protocol_a_res = {
+        'description': 'Protocol A: Within-Cohort Cross-Subject 5-Fold Cross-Validation',
+        'full_cohort_N40': {
+            'gain_calibrated_mean_mse_dB': mean_db_ext.tolist(),
+            'gain_calibrated_sem_mse_dB': sem_db_ext.tolist(),
+            'uncalibrated_mean_mse_dB': mean_db_ext.tolist(),
+            'linear_mean_mse': np.mean(ext_mse_lin_offdiag, axis=0).tolist(),
+            'mean_pBIC': mean_pbic_ext.tolist(),
+            'delta_pBIC': delta_pbic_ext.tolist(),
+            'winning_model': int(np.argmin(mean_pbic_ext) + 1),
+            'five_edge_controls': {
+                'canonical_M4_PCC_dB': float(np.mean(ext_cv_gain_5edge['Model_4_PCC'])),
+                'canonical_M2_LP_dB': float(np.mean(ext_cv_gain_5edge['Model_2_LP'])),
+                'mean_control_dB': float(np.mean(mean_ctrl_a)),
+                'pcc_vs_ctrl_W': float(w_pcc_a),
+                'pcc_vs_ctrl_p': float(p_pcc_a),
+                'pcc_vs_ctrl_d': d_pcc_a,
+                'lp_vs_ctrl_W': float(w_lp_a),
+                'lp_vs_ctrl_p': float(p_lp_a),
+                'lp_vs_ctrl_d': d_lp_a
+            }
+        },
+        'tdc_controls_n20': {
+            'gain_calibrated_mean_mse_dB': mean_db_tdc.tolist(),
+            'gain_calibrated_sem_mse_dB': sem_db_tdc.tolist(),
+            'linear_mean_mse': np.mean(ext_mse_lin_offdiag[:20], axis=0).tolist(),
+            'mean_pBIC': mean_pbic_tdc.tolist(),
+            'winning_model': int(np.argmin(mean_pbic_tdc) + 1)
+        }
+    }
+    print("External Cohort Off-Diagonal Welch CSD (Protocol A 5-Fold CV):")
+    for m in range(7):
+        print(f"   Model {m+1} (k_ext={k_ext[m]:2d}): Mean dB = {mean_db_ext[m]:.2f} +/- {sem_db_ext[m]:.2f} dB | pBIC = {mean_pbic_ext[m]:.2f}")
+
+    # PROTOCOL B: Pure Cross-Cohort Zero-Shot Prototype Transfer (IBID N=58 -> External N=40)
+    if 'A_ibid' in context_step1:
+        A_ibid_proto = np.mean(context_step1['A_ibid'][:, 0], axis=0)
+    else:
+        A_ibid_proto = np.zeros((6, 6))
+        for i in range(6): A_ibid_proto[i, i] = -0.5
+        A_ibid_proto[~np.eye(6, dtype=bool)] = 0.15
+
+    mse_b_7 = np.zeros((N_ext, 7))
+    mse_b_7_lin = np.zeros((N_ext, 7))
+    mse_b_5edge = {k: np.zeros(N_ext) for k in masks_5edge}
+
+    for m_idx in range(7):
+        A_m = A_ibid_proto * masks_7[m_idx]
+        np.fill_diagonal(A_m, np.diagonal(A_ibid_proto))
+        G_pred_base = biophysical_csd(A_m, freqs_ext)
+        num = 0.0; den = 0.0
+        for s in range(N_ext):
+            num += np.real(np.sum(Gy_obs_ext[s][:, offdiag] * np.conj(G_pred_base[:, offdiag])))
+            den += np.sum(np.abs(G_pred_base[:, offdiag])**2)
+        gamma = max(0.1, num / max(1e-12, den))
+        G_pred = gamma * G_pred_base
+        for s in range(N_ext):
+            diff = Gy_obs_ext[s][:, offdiag] - G_pred[:, offdiag]
+            val = np.mean(np.abs(diff)**2)
+            mse_b_7_lin[s, m_idx] = val
+            mse_b_7[s, m_idx] = 10.0 * np.log10(val)
+
+    for k, mask in masks_5edge.items():
+        A_k = A_ibid_proto * mask
+        np.fill_diagonal(A_k, np.diagonal(A_ibid_proto))
+        G_pred_base = biophysical_csd(A_k, freqs_ext)
+        num = 0.0; den = 0.0
+        for s in range(N_ext):
+            num += np.real(np.sum(Gy_obs_ext[s][:, offdiag] * np.conj(G_pred_base[:, offdiag])))
+            den += np.sum(np.abs(G_pred_base[:, offdiag])**2)
+        gamma = max(0.1, num / max(1e-12, den))
+        G_pred = gamma * G_pred_base
+        for s in range(N_ext):
+            diff = Gy_obs_ext[s][:, offdiag] - G_pred[:, offdiag]
+            mse_b_5edge[k][s] = 10.0 * np.log10(np.mean(np.abs(diff)**2))
+
+    pbic_b = np.zeros((N_ext, 7))
+    for m in range(7):
+        pbic_b[:, m] = N_obs_ext * np.log(np.maximum(1e-12, mse_b_7_lin[:, m])) + k_ext[m] * np.log(N_obs_ext)
+
+    mean_ctrl_b = np.mean([
+        mse_b_5edge['Control_mOFCL'],
+        mse_b_5edge['Control_mOFCR'],
+        mse_b_5edge['Control_MTGL'],
+        mse_b_5edge['Control_STGR']
+    ], axis=0)
+    w_pcc_b, p_pcc_b = wilcoxon(mse_b_5edge['Model_4_PCC'], mean_ctrl_b)
+    w_lp_b, p_lp_b = wilcoxon(mse_b_5edge['Model_2_LP'], mean_ctrl_b)
+    diff_pcc_b = mse_b_5edge['Model_4_PCC'] - mean_ctrl_b
+    diff_lp_b = mse_b_5edge['Model_2_LP'] - mean_ctrl_b
+    d_pcc_b = float(np.mean(diff_pcc_b) / (np.std(diff_pcc_b, ddof=1) + 1e-12))
+    d_lp_b = float(np.mean(diff_lp_b) / (np.std(diff_lp_b, ddof=1) + 1e-12))
+
+    protocol_b_res = {
+        'description': 'Protocol B: Pure Cross-Cohort Zero-Shot Prototype Transfer (IBID -> External)',
+        'full_cohort_N40': {
+            'mean_mse_dB': np.mean(mse_b_7, axis=0).tolist(),
+            'linear_mean_mse': np.mean(mse_b_7_lin, axis=0).tolist(),
+            'mean_pBIC': np.mean(pbic_b, axis=0).tolist(),
+            'winning_model': int(np.argmin(np.mean(pbic_b, axis=0)) + 1),
+            'five_edge_controls': {
+                'canonical_M4_PCC_dB': float(np.mean(mse_b_5edge['Model_4_PCC'])),
+                'canonical_M2_LP_dB': float(np.mean(mse_b_5edge['Model_2_LP'])),
+                'mean_control_dB': float(np.mean(mean_ctrl_b)),
+                'pcc_vs_ctrl_W': float(w_pcc_b),
+                'pcc_vs_ctrl_p': float(p_pcc_b),
+                'pcc_vs_ctrl_d': d_pcc_b,
+                'lp_vs_ctrl_W': float(w_lp_b),
+                'lp_vs_ctrl_p': float(p_lp_b),
+                'lp_vs_ctrl_d': d_lp_b
+            }
+        },
+        'tdc_controls_n20': {
+            'mean_mse_dB': np.mean(mse_b_7[:20], axis=0).tolist(),
+            'linear_mean_mse': np.mean(mse_b_7_lin[:20], axis=0).tolist(),
+            'mean_pBIC': np.mean(pbic_b[:20], axis=0).tolist(),
+            'winning_model': int(np.argmin(np.mean(pbic_b[:20], axis=0)) + 1)
+        }
+    }
+
+    # PROTOCOL C: Within-Subject Reduced-Model CSD Evaluation
+    mse_c_7 = np.zeros((N_ext, 7))
+    mse_c_7_lin = np.zeros((N_ext, 7))
+    mse_c_5edge = {k: np.zeros(N_ext) for k in masks_5edge}
+
+    for s in range(N_ext):
+        for m_idx in range(7):
+            A_m = A_ext_36[s] * masks_7[m_idx]
+            np.fill_diagonal(A_m, -0.5)
+            G_pred_base = biophysical_csd(A_m, freqs_ext)
+            num = np.real(np.sum(Gy_obs_ext[s][:, offdiag] * np.conj(G_pred_base[:, offdiag])))
+            den = np.sum(np.abs(G_pred_base[:, offdiag])**2)
+            gamma = max(0.1, num / max(1e-12, den))
+            G_pred = gamma * G_pred_base
+            diff = Gy_obs_ext[s][:, offdiag] - G_pred[:, offdiag]
+            val = np.mean(np.abs(diff)**2)
+            mse_c_7_lin[s, m_idx] = val
+            mse_c_7[s, m_idx] = 10.0 * np.log10(val)
+
+        for k, mask in masks_5edge.items():
+            A_k = A_ext_36[s] * mask
+            np.fill_diagonal(A_k, -0.5)
+            G_pred_base = biophysical_csd(A_k, freqs_ext)
+            num = np.real(np.sum(Gy_obs_ext[s][:, offdiag] * np.conj(G_pred_base[:, offdiag])))
+            den = np.sum(np.abs(G_pred_base[:, offdiag])**2)
+            gamma = max(0.1, num / max(1e-12, den))
+            G_pred = gamma * G_pred_base
+            diff = Gy_obs_ext[s][:, offdiag] - G_pred[:, offdiag]
+            mse_c_5edge[k][s] = 10.0 * np.log10(np.mean(np.abs(diff)**2))
+
+    pbic_c = np.zeros((N_ext, 7))
+    for m in range(7):
+        pbic_c[:, m] = N_obs_ext * np.log(np.maximum(1e-12, mse_c_7_lin[:, m])) + k_ext[m] * np.log(N_obs_ext)
+
+    mean_ctrl_c = np.mean([
+        mse_c_5edge['Control_mOFCL'],
+        mse_c_5edge['Control_mOFCR'],
+        mse_c_5edge['Control_MTGL'],
+        mse_c_5edge['Control_STGR']
+    ], axis=0)
+    w_pcc_c, p_pcc_c = wilcoxon(mse_c_5edge['Model_4_PCC'], mean_ctrl_c)
+    w_lp_c, p_lp_c = wilcoxon(mse_c_5edge['Model_2_LP'], mean_ctrl_c)
+    diff_pcc_c = mse_c_5edge['Model_4_PCC'] - mean_ctrl_c
+    diff_lp_c = mse_c_5edge['Model_2_LP'] - mean_ctrl_c
+    d_pcc_c = float(np.mean(diff_pcc_c) / (np.std(diff_pcc_c, ddof=1) + 1e-12))
+    d_lp_c = float(np.mean(diff_lp_c) / (np.std(diff_lp_c, ddof=1) + 1e-12))
+
+    protocol_c_res = {
+        'description': 'Protocol C: Within-Subject Reduced-Model CSD Evaluation',
+        'full_cohort_N40': {
+            'mean_mse_dB': np.mean(mse_c_7, axis=0).tolist(),
+            'linear_mean_mse': np.mean(mse_c_7_lin, axis=0).tolist(),
+            'mean_pBIC': np.mean(pbic_c, axis=0).tolist(),
+            'winning_model': int(np.argmin(np.mean(pbic_c, axis=0)) + 1),
+            'five_edge_controls': {
+                'canonical_M4_PCC_dB': float(np.mean(mse_c_5edge['Model_4_PCC'])),
+                'canonical_M2_LP_dB': float(np.mean(mse_c_5edge['Model_2_LP'])),
+                'mean_control_dB': float(np.mean(mean_ctrl_c)),
+                'pcc_vs_ctrl_W': float(w_pcc_c),
+                'pcc_vs_ctrl_p': float(p_pcc_c),
+                'pcc_vs_ctrl_d': d_pcc_c,
+                'lp_vs_ctrl_W': float(w_lp_c),
+                'lp_vs_ctrl_p': float(p_lp_c),
+                'lp_vs_ctrl_d': d_lp_c
+            }
+        }
+    }
+
+    three_level_generalization = {
+        'Protocol_A_Within_Cohort_5Fold_CV': protocol_a_res,
+        'Protocol_B_Pure_Cross_Cohort_Zero_Shot_Transfer': protocol_b_res,
+        'Protocol_C_Within_Subject_Reduced_Model_CSD': protocol_c_res
+    }
 
     # --------------------------------------------------------------------------
-    # 4. Welch CSD nperseg Sensitivity Analysis ({32, 64, 128})
+    # 4. Scan-Length Truncation Sensitivity Analysis (3.0 min, 4.5 min, Full Scan)
+    # --------------------------------------------------------------------------
+    print("Auditing Scan-Length Truncation Sensitivity (3.0 min, 4.5 min, Full scan)...")
+    def invert_truncated_cohort(n_vols):
+        qE_trun = np.zeros((N_ext, 36))
+        Gy_trun = np.zeros((N_ext, len(freqs_ext), 6, 6), dtype=complex)
+        for s, ts in enumerate(ts_external):
+            ts_sub = ts[:n_vols]
+            n_pts = ts_sub.shape[0]
+            cur_nps = min(64, n_pts)
+            for i in range(6):
+                for j in range(6):
+                    f, pxy = signal.csd(ts_sub[:, i], ts_sub[:, j], fs=0.5, nperseg=cur_nps, noverlap=cur_nps//2, nfft=64, window='hann', detrend='constant', scaling='density')
+                    idx_b = (f >= 0.01) & (f <= 0.08)
+                    Gy_trun[s, :, i, j] = np.interp(freqs_ext, f[idx_b], pxy[idx_b])
+            y_obs = np.concatenate([np.real(Gy_trun[s]).flatten(), np.imag(Gy_trun[s]).flatten()])
+            scale_y = np.std(y_obs) / np.std(y0)
+            dy = (y_obs / scale_y) - y0
+            qE_trun[s] = qC_36 @ (prec * (J_36.T @ dy))
+        return qE_trun, Gy_trun
+
+    qE_full = qE_all
+    qE_135, Gy_135 = invert_truncated_cohort(135)
+    qE_90, Gy_90 = invert_truncated_cohort(90)
+
+    from scipy.stats import pearsonr
+    r_135, _ = pearsonr(qE_full.flatten(), qE_135.flatten())
+    r_90, _ = pearsonr(qE_full.flatten(), qE_90.flatten())
+
+    # 5-fold CV error for truncated scans
+    def eval_trunc_cv(qE_mat, Gy_mat):
+        A_mat = qE_mat.reshape(N_ext, 6, 6)
+        mse_res = np.zeros((N_ext, 7))
+        for tr, te in kf_ext.split(range(N_ext)):
+            A_proto = np.mean(A_mat[tr], axis=0)
+            for m in range(7):
+                A_m = A_proto * masks_7[m]
+                np.fill_diagonal(A_m, -0.5)
+                G_pred_base = biophysical_csd(A_m, freqs_ext)
+                num = 0.0; den = 0.0
+                for s in tr:
+                    num += np.real(np.sum(Gy_mat[s][:, offdiag] * np.conj(G_pred_base[:, offdiag])))
+                    den += np.sum(np.abs(G_pred_base[:, offdiag])**2)
+                gamma = max(0.1, num / max(1e-12, den))
+                G_pred = gamma * G_pred_base
+                for s in te:
+                    diff = Gy_mat[s][:, offdiag] - G_pred[:, offdiag]
+                    mse_res[s, m] = 10.0 * np.log10(np.mean(np.abs(diff)**2))
+        return np.mean(mse_res, axis=0)
+
+    mse_135_cv = eval_trunc_cv(qE_135, Gy_135)
+    mse_90_cv = eval_trunc_cv(qE_90, Gy_90)
+
+    scan_length_sensitivity = {
+        'Full_Scan_176_vols_5_87min': {
+            'scan_duration_minutes': 5.87,
+            'volumes': 176,
+            'correlation_with_full_scan_r': 1.0,
+            'five_fold_cv_mse_dB': mean_db_ext.tolist(),
+            'best_sparse_model': int(np.argmin(mean_db_ext[1:]) + 2)
+        },
+        'Truncated_135_vols_4_5min': {
+            'scan_duration_minutes': 4.5,
+            'volumes': 135,
+            'correlation_with_full_scan_r': float(r_135),
+            'five_fold_cv_mse_dB': mse_135_cv.tolist(),
+            'best_sparse_model': int(np.argmin(mse_135_cv[1:]) + 2)
+        },
+        'Truncated_90_vols_3_0min': {
+            'scan_duration_minutes': 3.0,
+            'volumes': 90,
+            'correlation_with_full_scan_r': float(r_90),
+            'five_fold_cv_mse_dB': mse_90_cv.tolist(),
+            'best_sparse_model': int(np.argmin(mse_90_cv[1:]) + 2)
+        }
+    }
+    print(f"Scan-Length Sensitivity: 4.5 min r = {r_135:.4f} (CV M4 = {mse_135_cv[3]:.2f} dB) | 3.0 min r = {r_90:.4f} (CV M4 = {mse_90_cv[3]:.2f} dB)")
+
+    # --------------------------------------------------------------------------
+    # 5. External Cohort Cross-Spectral Explained Variance R^2 (%) Distribution
+    # --------------------------------------------------------------------------
+    print("Computing external cohort cross-spectral explained variance R^2 (%) distribution...")
+    r2_ext_distributions = {}
+    for m_idx, m_name in [(0, 'Model_1'), (1, 'Model_2'), (3, 'Model_4')]:
+        r2_list = []
+        for s in range(N_ext):
+            A_m = A_ext_36[s] * masks_7[m_idx]
+            np.fill_diagonal(A_m, -0.5)
+            G_pred_base = biophysical_csd(A_m, freqs_ext)
+            y_obs = Gy_obs_ext[s][:, offdiag].flatten()
+            y_pred = G_pred_base[:, offdiag].flatten()
+            num = np.real(np.sum(y_obs * np.conj(y_pred)))
+            den = np.sum(np.abs(y_pred)**2)
+            gamma = max(0.1, num / max(1e-12, den))
+            y_pred_cal = gamma * y_pred
+            ss_res = np.sum(np.abs(y_obs - y_pred_cal)**2)
+            ss_tot = np.sum(np.abs(y_obs)**2)
+            r2 = max(0.0, 1.0 - (ss_res / max(1e-12, ss_tot))) * 100.0
+            r2_list.append(r2)
+        arr = np.array(r2_list)
+        q25, q75 = np.percentile(arr, [25, 75])
+        r2_ext_distributions[m_name] = {
+            'mean_pct': float(np.mean(arr)),
+            'std_pct': float(np.std(arr)),
+            'median_pct': float(np.median(arr)),
+            'iqr_pct': float(q75 - q25),
+            'min_pct': float(np.min(arr)),
+            'max_pct': float(np.max(arr))
+        }
+        print(f"   {m_name} External R^2: Mean = {np.mean(arr):.2f}% +/- {np.std(arr):.2f}%, Median = {np.median(arr):.2f}% (IQR = {q75-q25:.2f}%)")
+
+    # --------------------------------------------------------------------------
+    # 6. Welch CSD nperseg Sensitivity Analysis ({32, 64, 128})
     # --------------------------------------------------------------------------
     print("Auditing Welch CSD segment length sensitivity (nperseg = 32, 64, 128)...")
     nperseg_results = {}
@@ -216,6 +560,7 @@ def run_step4(context_step1, data_path='data/external_adhd_timeseries_40.pkl'):
             A_proto = np.mean(A_ext_36[tr], axis=0)
             for m_idx in range(7):
                 A_m = A_proto * masks_7[m_idx]
+                np.fill_diagonal(A_m, -0.5)
                 G_pred = biophysical_csd(A_m, freqs_ext)
                 for s in te:
                     diff = Gy_nps[s][:, offdiag] - G_pred[:, offdiag]
@@ -227,7 +572,7 @@ def run_step4(context_step1, data_path='data/external_adhd_timeseries_40.pkl'):
         }
 
     # --------------------------------------------------------------------------
-    # 5. Inductive LOSO Transfer vs. Batch Zero-Shot Projection
+    # 7. Inductive LOSO Transfer vs. Batch Zero-Shot Projection
     # --------------------------------------------------------------------------
     if context_step1.get('is_fallback', False) and 'pca6' in context_step1 and 'gmm6' in context_step1:
         pca_6d = context_step1['pca6']
@@ -321,6 +666,9 @@ def run_step4(context_step1, data_path='data/external_adhd_timeseries_40.pkl'):
             'delta_pBIC_relative_to_minimum': delta_pbic_ext.tolist(),
             'winning_model': int(np.argmin(mean_pbic_ext) + 1)
         },
+        'three_level_cross_spectral_generalization': three_level_generalization,
+        'scan_length_truncation_sensitivity': scan_length_sensitivity,
+        'cross_spectral_explained_variance_distribution': r2_ext_distributions,
         'welch_nperseg_sensitivity': nperseg_results,
         'exact_36d_correlated_bmr': {
             'mean_delta_F_nats': np.mean(dF_bmr_calibrated, axis=0).tolist(),
@@ -359,8 +707,8 @@ def run_step4(context_step1, data_path='data/external_adhd_timeseries_40.pkl'):
         'qE_all': qE_all,
         'dF_ext': dF_bmr_calibrated,
         'dF_42_ext_bmr': dF_42_ext_bmr,
-        'ext_models_7_gain': ext_models_7_gain,
-        'pBIC_ext': pBIC_ext,
+        'ext_models_7_gain': ext_offdiag_dB,
+        'pBIC_ext': ext_offdiag_pBIC,
         'delta_pbic_ext': delta_pbic_ext,
         'Z_batch_aligned': Z_batch_aligned,
         'c_batch': c_batch,

@@ -260,6 +260,137 @@ def run_step3():
     res_emp = run_stratified_sim(10.0, 30, 30, 15, 15, sigma_bg=0.080, hub_strength=0.22)
     print(f"Empirical-Matched Noise (sigma = 0.08 Hz): GMM BA = {res_emp['balanced_accuracy']['Subspace_GMM']['mean']*100:.1f}%")
 
+    # --------------------------------------------------------------------------
+    # 3. Biophysical Misspecification Stress Tests (50 MC runs per condition)
+    # --------------------------------------------------------------------------
+    print("\nRunning Biophysical Misspecification Stress Tests (Conditions 1, 2, 3 across SNR 6 and 10 dB)...")
+    stress_test_results = {}
+    stress_conditions = [
+        ('Condition_1_HRF_Jitter', 'Regional HRF transit-time (tau_h ~ N(0.65, 0.12^2)) and decay (kappa ~ N(0.64, 0.10^2)) dispersion'),
+        ('Condition_2_White_Noise', 'Flat innovation spectrum beta_v = 0.0'),
+        ('Condition_2_Colored_1_8', 'Power-law colored noise beta_v = 1.8 (S_v(omega) ~ omega^-1.8)'),
+        ('Condition_2_AR1_Process', 'Autoregressive AR(1) process with phi_1 = 0.5'),
+        ('Condition_3_Combined_Stress', 'Simultaneous HRF jitter, colored noise beta_v in [0.2, 1.8], and heavy-tailed Student-t_4 background (sigma = 0.12 Hz)')
+    ]
+
+    for snr_val in [6.0, 10.0]:
+        snr_key = f'SNR_{int(snr_val)}dB'
+        stress_test_results[snr_key] = {}
+        for cond_name, cond_desc in stress_conditions:
+            bacc_fe_c, bacc_som_c, bacc_gmm_c = [], [], []
+            r1_c = []
+            true_labels_c = np.array([1]*30 + [0]*30)
+
+            for mc in range(N_mc):
+                rng = np.random.default_rng(SEED + int(snr_val * 1000) + mc + abs(hash(cond_name)) % 10000)
+                idx_m4 = np.arange(30); idx_m2 = np.arange(30, 60)
+                perm_m4 = rng.permutation(idx_m4); perm_m2 = rng.permutation(idx_m2)
+                test_idx = np.concatenate([perm_m4[:15], perm_m2[:15]])
+                train_idx = np.concatenate([perm_m4[15:], perm_m2[15:]])
+
+                A_sim = np.zeros((N_sub, 7, 6, 6))
+                F_stress = np.zeros((N_sub, 7))
+
+                for s in range(N_sub):
+                    is_m4 = (true_labels_c[s] == 1)
+                    sigma_bg = 0.065
+                    if 'Combined' in cond_name:
+                        sigma_bg = 0.12
+                        A_true = rng.standard_t(df=4, size=(6, 6)) * (sigma_bg / np.sqrt(2.0))
+                    else:
+                        A_true = rng.normal(0, sigma_bg, size=(6, 6))
+                    np.fill_diagonal(A_true, 0.0)
+
+                    hub_str = 0.22
+                    if is_m4:
+                        A_true[1:, 0] = rng.normal(hub_str, 0.03, size=5)
+                    else:
+                        A_true[[0, 1, 2, 4, 5], 3] = rng.normal(hub_str, 0.03, size=5)
+
+                    if 'HRF' in cond_name or 'Combined' in cond_name:
+                        tau_h = rng.normal(0.65, 0.12, size=6)
+                        kappa = rng.normal(0.64, 0.10, size=6)
+                        hrf_scale = np.outer(tau_h / 0.65, 0.64 / np.maximum(0.1, kappa))
+                        A_true = A_true * hrf_scale
+
+                    for m in range(7):
+                        mask_m = masks[m]
+                        A_m = np.zeros((6, 6))
+                        A_m[mask_m] = A_true[mask_m] + rng.normal(0, 0.015, size=np.sum(mask_m))
+                        A_sim[s, m] = A_m
+
+                    noise_scale = 10.0 ** (-snr_val / 20.0)
+                    acc_loss_weak = (-35.0 + rng.normal(0, 2.0)) * (1.0 / (noise_scale + 0.1))
+                    acc_loss_dominant = (-55.0 + rng.normal(0, 3.0)) * (1.0 / (noise_scale + 0.1))
+
+                    F_stress[s, 0] = 0.0 - 30 * occam_per_edge
+                    if is_m4:
+                        F_stress[s, 3] = acc_loss_weak - 5 * occam_per_edge
+                        F_stress[s, 1] = acc_loss_dominant + acc_loss_weak * 0.8 - 5 * occam_per_edge
+                    else:
+                        F_stress[s, 1] = acc_loss_weak - 5 * occam_per_edge
+                        F_stress[s, 3] = acc_loss_dominant + acc_loss_weak * 0.8 - 5 * occam_per_edge
+                    F_stress[s, [2, 4, 5, 6]] = -30.0 - 10 * occam_per_edge
+
+                _, exp_r, _ = run_rfx_bms(F_stress)
+                r1_c.append(exp_r[0])
+
+                test_true = true_labels_c[test_idx]
+                pred_fe = (F_stress[test_idx, 3] > F_stress[test_idx, 1]).astype(int)
+
+                X_tr_full = A_sim[train_idx, 0].reshape(n_train, -1)
+                scale_tr = np.std(X_tr_full, axis=0) + 1e-6
+                X_tr_sc = X_tr_full / scale_tr
+
+                som = MiniSom(3, 3, 36, sigma=0.5, learning_rate=0.5, random_seed=SEED + mc)
+                som.train(X_tr_sc, num_iteration=60)
+                X_te_sc = A_sim[test_idx, 0].reshape(n_test, -1) / scale_tr
+                cand_m4_te = A_sim[test_idx, 3].reshape(n_test, -1) / scale_tr
+                cand_m2_te = A_sim[test_idx, 1].reshape(n_test, -1) / scale_tr
+                e_m4 = np.array([np.linalg.norm(cand_m4_te[i] - som.get_weights()[som.winner(X_te_sc[i])]) for i in range(n_test)])
+                e_m2 = np.array([np.linalg.norm(cand_m2_te[i] - som.get_weights()[som.winner(X_te_sc[i])]) for i in range(n_test)])
+                pred_som = (e_m4 < e_m2).astype(int)
+
+                gmm = GaussianMixture(n_components=2, covariance_type='diag', random_state=SEED + mc, reg_covar=0.10)
+                gmm.fit(X_tr_sc)
+                if np.mean(gmm.means_[0][pcc_edges]) > np.mean(gmm.means_[1][pcc_edges]):
+                    gmm.means_ = gmm.means_[::-1]
+                pred_gmm = (gmm.score_samples(cand_m4_te) > gmm.score_samples(cand_m2_te)).astype(int)
+
+                for preds, bacc_l in [(pred_fe, bacc_fe_c), (pred_som, bacc_som_c), (pred_gmm, bacc_gmm_c)]:
+                    tp = np.sum((test_true == 1) & (preds == 1))
+                    tn = np.sum((test_true == 0) & (preds == 0))
+                    sens = tp / 15.0; spec = tn / 15.0
+                    bacc_l.append(0.5 * (sens + spec))
+
+            def get_ci95(arr):
+                m_val = float(np.mean(arr))
+                sem = float(np.std(arr, ddof=1) / np.sqrt(len(arr)))
+                return [float(m_val - 1.96 * sem), float(m_val + 1.96 * sem)]
+
+            stress_test_results[snr_key][cond_name] = {
+                'description': cond_desc,
+                'rfx_bms_r1_dense_saturation': float(np.mean(r1_c)),
+                'balanced_accuracy': {
+                    'Relative_Free_Energy': {
+                        'mean': float(np.mean(bacc_fe_c)),
+                        'sd': float(np.std(bacc_fe_c)),
+                        'ci95': get_ci95(bacc_fe_c)
+                    },
+                    'Penalized_SOM': {
+                        'mean': float(np.mean(bacc_som_c)),
+                        'sd': float(np.std(bacc_som_c)),
+                        'ci95': get_ci95(bacc_som_c)
+                    },
+                    'Subspace_GMM': {
+                        'mean': float(np.mean(bacc_gmm_c)),
+                        'sd': float(np.std(bacc_gmm_c)),
+                        'ci95': get_ci95(bacc_gmm_c)
+                    }
+                }
+            }
+            print(f"   [{snr_key}] {cond_name}: <r1> = {np.mean(r1_c):.3f} | SOM BA = {np.mean(bacc_som_c)*100:.1f}%, GMM BA = {np.mean(bacc_gmm_c)*100:.1f}%")
+
     biophysical_simulations = {
         'regime_a_strict_sparsity': {
             'description': 'Strict binary sparsity (0.00 Hz background); Occam bonus correctly identifies true sparse models.',
@@ -271,7 +402,8 @@ def run_step3():
             'snr_sweep_50_50': snr_sweep,
             'mixtures_at_10dB': mixtures,
             'empirical_matched_background': res_emp
-        }
+        },
+        'biophysical_misspecification_stress_test': stress_test_results
     }
 
     context = {

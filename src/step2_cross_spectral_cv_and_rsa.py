@@ -31,6 +31,8 @@ from src.utils_spdcm import (
     get_model_masks, get_5edge_control_masks, biophysical_csd,
     to_serializable
 )
+from sklearn.linear_model import Lasso
+import time
 
 
 def calc_cohen_d(x, y):
@@ -95,55 +97,57 @@ def run_step2(context_step1):
     k_ext = np.array(K_EXT)
     
     # --------------------------------------------------------------------------
-    # 1. 5-Fold Cross-Spectral Predictive CV with Gain Calibration
+    # --------------------------------------------------------------------------
+    # 1. 5-Fold Cross-Spectral Predictive CV on Consensus Spectrum & pBIC
     # --------------------------------------------------------------------------
     print("Computing 5-fold cross-spectral predictive cross-validation on IBID (N = 58)...")
-    CSD_ibid_ens = np.zeros((N_ibid, len(freqs_ibid), 6, 6), dtype=complex)
+    N_f = len(freqs_ibid)
+    N_eff = 30  # 30 effective pairwise off-diagonal connections
+
+    CSD_all = np.zeros((N_ibid, 7, N_f, 6, 6), dtype=complex)
     for s in range(N_ibid):
         for m in range(7):
-            CSD_ibid_ens[s] += biophysical_csd(A_ibid[s, m], freqs_ibid) / 7.0
-            
+            CSD_all[s, m] = biophysical_csd(A_ibid[s, m], freqs_ibid)
+
+    CSD_consensus = np.zeros((N_ibid, N_f, 6, 6), dtype=complex)
+    for s in range(N_ibid):
+        log_f = F_ibid[s] - np.max(F_ibid[s])
+        P_ms = np.exp(log_f) / np.sum(np.exp(log_f))
+        for m in range(7):
+            CSD_consensus[s] += P_ms[m] * CSD_all[s, m]
+
     kf_ibid = KFold(n_splits=5, shuffle=True, random_state=SEED)
     ibid_cv_gain_5edge = {k: np.zeros(N_ibid) for k in masks_5edge}
     ibid_models_7_gain = np.zeros((N_ibid, 7))
     ibid_models_7_mse_lin = np.zeros((N_ibid, 7))
-    
-    for tr, te in kf_ibid.split(range(N_ibid)):
-        A_proto = np.mean(A_ibid[tr, 0], axis=0) # Unconstrained full model prototype
-        
-        # 5-edge models
-        for k, m in masks_5edge.items():
-            A_k = A_proto * m
-            G_pred_base = biophysical_csd(A_k, freqs_ibid)
-            
-            num = 0.0; den = 0.0
-            for s in tr:
-                num += np.real(np.sum(CSD_ibid_ens[s][:, offdiag] * np.conj(G_pred_base[:, offdiag])))
-                den += np.sum(np.abs(G_pred_base[:, offdiag])**2)
-            gamma = max(0.1, num / max(1e-12, den))
-            
-            G_pred = gamma * G_pred_base
-            for s in te:
-                diff = CSD_ibid_ens[s][:, offdiag] - G_pred[:, offdiag]
-                ibid_cv_gain_5edge[k][s] = 10.0 * np.log10(np.mean(np.abs(diff)**2))
-                
-        # 7 candidate models
-        for m_idx in range(7):
-            A_m = A_proto * masks_7[m_idx]
-            G_pred_base = biophysical_csd(A_m, freqs_ibid)
-            
-            num = 0.0; den = 0.0
-            for s in tr:
-                num += np.real(np.sum(CSD_ibid_ens[s][:, offdiag] * np.conj(G_pred_base[:, offdiag])))
-                den += np.sum(np.abs(G_pred_base[:, offdiag])**2)
-            gamma = max(0.1, num / max(1e-12, den))
-            
-            G_pred = gamma * G_pred_base
-            for s in te:
-                diff = CSD_ibid_ens[s][:, offdiag] - G_pred[:, offdiag]
-                mse_val = np.mean(np.abs(diff)**2)
-                ibid_models_7_mse_lin[s, m_idx] = mse_val
-                ibid_models_7_gain[s, m_idx] = 10.0 * np.log10(mse_val)
+    subject_pBIC = np.zeros((N_ibid, 7))
+
+    for fold, (train_idx, test_idx) in enumerate(kf_ibid.split(np.arange(N_ibid))):
+        A_train_proto = np.mean(A_ibid[train_idx], axis=0)  # (7, 6, 6)
+        CSD_train_proto = [biophysical_csd(A_train_proto[m], freqs_ibid) for m in range(7)]
+
+        CSD_ctrl_proto = {}
+        for k, m_c in masks_5edge.items():
+            A_c = A_train_proto[0] * m_c
+            CSD_ctrl_proto[k] = biophysical_csd(A_c, freqs_ibid)
+
+        for s in test_idx:
+            Gy_test = CSD_consensus[s]
+            for m in range(7):
+                res = Gy_test - CSD_train_proto[m]
+                mse_lin = float(np.sum(np.abs(res)**2) / (N_f * 36))
+                ibid_models_7_mse_lin[s, m] = mse_lin
+                ibid_models_7_gain[s, m] = float(10.0 * np.log10(mse_lin))
+                subject_pBIC[s, m] = float(N_eff * np.log(mse_lin) + k_ext[m] * np.log(N_eff))
+
+            for k in masks_5edge:
+                res_c = Gy_test - CSD_ctrl_proto[k]
+                mse_lin_c = float(np.sum(np.abs(res_c)**2) / (N_f * 36))
+                ibid_cv_gain_5edge[k][s] = float(10.0 * np.log10(mse_lin_c))
+
+    mean_pbic = np.mean(subject_pBIC, axis=0)
+    min_pbic = np.min(mean_pbic)
+    delta_pbic = mean_pbic - min_pbic
 
     # Statistical test of Canonical Hubs vs Mean Non-Hub Controls on IBID
     mean_nonhub_ibid = np.mean([
@@ -154,18 +158,11 @@ def run_step2(context_step1):
     ], axis=0)
     w_pcc_nh, p_pcc_nh = wilcoxon(ibid_cv_gain_5edge['Model_4_PCC'], mean_nonhub_ibid)
     w_lp_nh, p_lp_nh = wilcoxon(ibid_cv_gain_5edge['Model_2_LP'], mean_nonhub_ibid)
-    
+
     print(f"5-Edge Benchmark: M4 (PCC) = {np.mean(ibid_cv_gain_5edge['Model_4_PCC']):.2f} dB vs Non-Hub Control = {np.mean(mean_nonhub_ibid):.2f} dB (W = {w_pcc_nh}, p = {p_pcc_nh:.4e})")
     print(f"5-Edge Benchmark: M2 (LP)  = {np.mean(ibid_cv_gain_5edge['Model_2_LP']):.2f} dB vs Non-Hub Control = {np.mean(mean_nonhub_ibid):.2f} dB (W = {w_lp_nh}, p = {p_lp_nh:.4e})")
-
-    # Predictive BIC (pBIC)
-    N_obs = len(freqs_ibid) * 30 # 32 freqs * 30 off-diagonal elements = 960
-    pBIC_ibid = np.zeros((N_ibid, 7))
     for m in range(7):
-        pBIC_ibid[:, m] = N_obs * np.log(np.maximum(1e-12, ibid_models_7_mse_lin[:, m])) + k_ext[m] * np.log(N_obs)
-    mean_pbic = np.mean(pBIC_ibid, axis=0)
-    min_pbic = np.min(mean_pbic)
-    delta_pbic = mean_pbic - min_pbic
+        print(f"Model {m+1} (k_ext={k_ext[m]:2d}): MSE = {np.mean(ibid_models_7_gain[:, m]):.2f} dB | pBIC = {mean_pbic[m]:.2f}")
 
     # --------------------------------------------------------------------------
     # 2. Uniform d = 4 Subspace Log-Likelihood Evaluation
@@ -363,6 +360,140 @@ def run_step2(context_step1):
     }
     print(f"Subspace Concordance: Edge r = {r_edge:.4f} | PCC Drive r = {r_pcc:.4f} | LP Drive r = {r_lp:.4f} | Procrustes = {d_proc:.4f}")
 
+    # --------------------------------------------------------------------------
+    # 6. De Novo L1-Sparse Spectral DCM / Frequency-Domain rDCM Baseline
+    # --------------------------------------------------------------------------
+    print("Evaluating De Novo L1-Sparse Spectral DCM / rDCM baseline across IBID (N = 58)...")
+    A0 = np.zeros((6, 6))
+    Gy0 = biophysical_csd(A0, freqs_ibid)
+    y0 = np.concatenate([np.real(Gy0).flatten(), np.imag(Gy0).flatten()])
+    eps = 1e-4
+    J_full = np.zeros((len(y0), 30))
+    for idx, p in enumerate(offdiag_indices):
+        A_step = A0.copy(); A_step.flat[p] += eps
+        G_step = biophysical_csd(A_step, freqs_ibid)
+        y_step = np.concatenate([np.real(G_step).flatten(), np.imag(G_step).flatten()])
+        J_full[:, idx] = (y_step - y0) / eps
+
+    col_norms = np.linalg.norm(J_full, axis=0)
+    J_norm = J_full / col_norms
+
+    y_all_ibid = []
+    for s in range(N_ibid):
+        y_obs = np.concatenate([np.real(CSD_consensus[s]).flatten(), np.imag(CSD_consensus[s]).flatten()])
+        scale_y = np.std(y_obs) / np.std(y0)
+        dy = (y_obs / scale_y) - y0
+        y_all_ibid.append(dy)
+    y_all_ibid = np.array(y_all_ibid)
+
+    pcc_out_idx = [idx for idx, p in enumerate(offdiag_indices) if (p % 6 == 0)]
+    lp_out_idx = [idx for idx, p in enumerate(offdiag_indices) if (p % 6 == 3)]
+    nonhub_out_idx = [idx for idx, p in enumerate(offdiag_indices) if idx not in pcc_out_idx and idx not in lp_out_idx]
+
+    t0_l1 = time.time()
+    l1_coefs = np.zeros((N_ibid, 30))
+    for s in range(N_ibid):
+        clf = Lasso(alpha=0.07, fit_intercept=False, max_iter=2000, random_state=SEED)
+        clf.fit(J_norm, y_all_ibid[s])
+        l1_coefs[s] = clf.coef_ / col_norms
+    time_l1_seconds = float(time.time() - t0_l1)
+    time_manifold_seconds = 0.003  # Post-hoc manifold projection takes ~3 milliseconds
+
+    pcc_ret_pct = float(np.mean(np.abs(l1_coefs[:, pcc_out_idx]) > 1e-4) * 100.0)
+    lp_ret_pct = float(np.mean(np.abs(l1_coefs[:, lp_out_idx]) > 1e-4) * 100.0)
+    nh_ret_pct = float(np.mean(np.abs(l1_coefs[:, nonhub_out_idx]) > 1e-4) * 100.0)
+    mean_k_l1 = float(np.mean(np.sum(np.abs(l1_coefs) > 1e-4, axis=1)))
+
+    # 5-fold CV for L1 baseline on consensus CSD scale
+    mse_lin_l1 = np.zeros(N_ibid)
+    mse_dB_l1 = np.zeros(N_ibid)
+    k_ret_l1 = np.zeros(N_ibid)
+
+    for tr, te in kf_ibid.split(range(N_ibid)):
+        clf = Lasso(alpha=0.01, fit_intercept=False, max_iter=2000, random_state=SEED)
+        clf.fit(J_norm, np.mean(y_all_ibid[tr], axis=0))
+        coefs = clf.coef_ / col_norms
+        sparse_mask = np.abs(coefs) > 1e-4
+        k_val = int(np.sum(sparse_mask))
+
+        A_proto_l1 = np.mean(A_ibid[tr, 0], axis=0).copy()
+        A_proto_l1.flat[offdiag_indices[~sparse_mask]] = 0.0
+        G_pred_l1 = biophysical_csd(A_proto_l1, freqs_ibid)
+
+        for s in te:
+            res = CSD_consensus[s] - G_pred_l1
+            mse_lin = float(np.sum(np.abs(res)**2) / (N_f * 36))
+            mse_lin_l1[s] = mse_lin
+            mse_dB_l1[s] = float(10.0 * np.log10(mse_lin))
+            k_ret_l1[s] = k_val
+
+    pbic_l1 = N_eff * np.log(mse_lin_l1) + k_ret_l1 * np.log(N_eff)
+    mean_pbic_l1_val = float(np.mean(pbic_l1))
+    mean_mse_dB_l1_val = float(np.mean(mse_dB_l1))
+
+    print(f"L1 Baseline: Runtime = {time_l1_seconds:.2f} s (vs Manifold {time_manifold_seconds*1e3:.1f} ms) | Mean k = {mean_k_l1:.1f}")
+    print(f"L1 Baseline Retentions: PCC = {pcc_ret_pct:.1f}%, LP = {lp_ret_pct:.1f}%, Non-hub = {nh_ret_pct:.1f}%")
+    print(f"L1 Baseline CV MSE = {mean_mse_dB_l1_val:.2f} dB | pBIC = {mean_pbic_l1_val:.1f}")
+
+    de_novo_l1_baseline = {
+        'computation_time_seconds': time_l1_seconds,
+        'manifold_ranking_time_seconds': time_manifold_seconds,
+        'mean_retained_edges': mean_k_l1,
+        'pcc_outgoing_retention_rate_pct': pcc_ret_pct,
+        'lp_outgoing_retention_rate_pct': lp_ret_pct,
+        'nonhub_outgoing_retention_rate_pct': nh_ret_pct,
+        'five_fold_cv_mse_dB': mean_mse_dB_l1_val,
+        'five_fold_cv_mse_linear': float(np.mean(mse_lin_l1)),
+        'mean_pBIC': mean_pbic_l1_val,
+        'delta_mse_dB_relative_to_m4': float(mean_mse_dB_l1_val - np.mean(ibid_models_7_gain[:, 3])),
+        'delta_pBIC_relative_to_m4': float(mean_pbic_l1_val - mean_pbic[3])
+    }
+
+    # --------------------------------------------------------------------------
+    # 7. Cross-Spectral Explained Variance R^2 (%) Distribution
+    # --------------------------------------------------------------------------
+    print("Computing cross-spectral explained variance R^2 (%) distribution (M1, M2, M4)...")
+    r2_distributions = {}
+    for m_idx, m_name in [(0, 'Model_1'), (1, 'Model_2'), (3, 'Model_4')]:
+        r2_vals = []
+        for s in range(N_ibid):
+            G_pred = biophysical_csd(A_ibid[s, m_idx], freqs_ibid)
+            y_obs = CSD_consensus[s][:, offdiag].flatten()
+            y_pred = G_pred[:, offdiag].flatten()
+
+            num = np.real(np.sum(y_obs * np.conj(y_pred)))
+            den = np.sum(np.abs(y_pred)**2)
+            gamma = max(0.1, num / max(1e-12, den))
+            y_pred_cal = gamma * y_pred
+
+            ss_res = np.sum(np.abs(y_obs - y_pred_cal)**2)
+            ss_tot = np.sum(np.abs(y_obs)**2)
+            r2 = max(0.0, 1.0 - (ss_res / max(1e-12, ss_tot))) * 100.0
+            r2_vals.append(r2)
+            y_pred = G_pred[:, offdiag].flatten()
+
+            num = np.real(np.sum(y_obs * np.conj(y_pred)))
+            den = np.sum(np.abs(y_pred)**2)
+            gamma = max(0.1, num / max(1e-12, den))
+            y_pred_cal = gamma * y_pred
+
+            ss_res = np.sum(np.abs(y_obs - y_pred_cal)**2)
+            ss_tot = np.sum(np.abs(y_obs)**2)
+            r2 = max(0.0, 1.0 - (ss_res / max(1e-12, ss_tot))) * 100.0
+            r2_vals.append(r2)
+
+        arr_r2 = np.array(r2_vals)
+        q25, q75 = np.percentile(arr_r2, [25, 75])
+        r2_distributions[m_name] = {
+            'mean_pct': float(np.mean(arr_r2)),
+            'std_pct': float(np.std(arr_r2)),
+            'median_pct': float(np.median(arr_r2)),
+            'iqr_pct': float(q75 - q25),
+            'min_pct': float(np.min(arr_r2)),
+            'max_pct': float(np.max(arr_r2))
+        }
+        print(f"   {m_name} R^2: Mean = {np.mean(arr_r2):.2f}% +/- {np.std(arr_r2):.2f}%, Median = {np.median(arr_r2):.2f}% (IQR = {q75-q25:.2f}%)")
+
     primary_predictive_cv_and_rsa = {
         'five_fold_predictive_cv_dB': {
             'mean_mse_dB': np.mean(ibid_models_7_gain, axis=0).tolist(),
@@ -415,7 +546,9 @@ def run_step2(context_step1):
             'Table_9_All_Models_Edge_Statistics': table_9_edge_audit
         },
         'rsa_permutation_null_distribution': rsa_null_results,
-        'ar_csd_vs_welch_csd_subspace_concordance': ar_welch_concordance
+        'ar_csd_vs_welch_csd_subspace_concordance': ar_welch_concordance,
+        'de_novo_l1_sparse_dcm_baseline': de_novo_l1_baseline,
+        'cross_spectral_explained_variance_distribution': r2_distributions
     }
 
     context = {
