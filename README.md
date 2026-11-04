@@ -3,14 +3,7 @@
 **Regularized Manifold Ranking and Subspace Generative Embedding in Resting-State Spectral Dynamic Causal Modeling: Disentangling Graded Hub Hierarchies from Bayesian Over-Parameterization in the Default Mode Network**
 
 **Authors:**  
-**Hamidreza Sadeghsalehi**$^{1,2,3}$, **Fatemeh Ahmadi**$^4$, and **Arash Zare Sadeghi**$^{5,*}$
-
-$^1$School of Medicine, University of St Andrews, St Andrews, United Kingdom  
-$^2$Australian Institute of Health Innovation, Macquarie University, Sydney, Australia  
-$^3$Department of Neuroscience, Iran University of Medical Sciences, Tehran, Iran  
-$^4$Department of Engineering Sciences and Physics, Buein Zahra Technical University, Buein Zahra, Qazvin, Iran  
-$^5$Department of Medical Physics, School of Medicine, Iran University of Medical Sciences, Tehran, Iran  
-$^*$Corresponding Author: Arash Zare Sadeghi (`zare.a@iums.ac.ir`)
+**Hamidreza Sadeghsalehi**, **Fatemeh Ahmadi**, and **Arash Zare Sadeghi**
 
 ---
 
@@ -53,7 +46,7 @@ spdcm-manifold-ranking/
 
 1. **Clone the repository and install dependencies:**
 ```bash
-git clone https://github.com/<your-username>/spdcm-manifold-ranking.git
+git clone https://github.com/hamidreza-s-salehi/spdcm-manifold-ranking.git
 cd spdcm-manifold-ranking
 python -m venv venv
 source venv/bin/activate        # On Windows: venv\Scripts\activate
