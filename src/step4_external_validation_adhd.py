@@ -309,9 +309,11 @@ def run_step4(context_step1, data_path='data/external_adhd_timeseries_40.pkl'):
             diff = Gy_obs_ext[s][:, offdiag] - G_pred[:, offdiag]
             mse_b_5edge[k][s] = 10.0 * np.log10(np.mean(np.abs(diff)**2))
 
-    pbic_b = np.zeros((N_ext, 7))
+    pbic_b_30 = np.zeros((N_ext, 7))
+    pbic_b_480 = np.zeros((N_ext, 7))
     for m in range(7):
-        pbic_b[:, m] = N_obs_ext * np.log(np.maximum(1e-12, mse_b_7_lin[:, m])) + k_ext[m] * np.log(N_obs_ext)
+        pbic_b_30[:, m] = N_eff_ext * np.log(np.maximum(1e-12, mse_b_7_lin[:, m])) + k_ext[m] * np.log(N_eff_ext)
+        pbic_b_480[:, m] = N_obs_ext * np.log(np.maximum(1e-12, mse_b_7_lin[:, m])) + k_ext[m] * np.log(N_obs_ext)
 
     mean_ctrl_b = np.mean([
         mse_b_5edge['Control_mOFCL'],
@@ -331,8 +333,10 @@ def run_step4(context_step1, data_path='data/external_adhd_timeseries_40.pkl'):
         'full_cohort_N40': {
             'mean_mse_dB': np.mean(mse_b_7, axis=0).tolist(),
             'linear_mean_mse': np.mean(mse_b_7_lin, axis=0).tolist(),
-            'mean_pBIC': np.mean(pbic_b, axis=0).tolist(),
-            'winning_model': int(np.argmin(np.mean(pbic_b, axis=0)) + 1),
+            'mean_pBIC': np.mean(pbic_b_30, axis=0).tolist(),
+            'mean_pBIC_30': np.mean(pbic_b_30, axis=0).tolist(),
+            'mean_pBIC_480': np.mean(pbic_b_480, axis=0).tolist(),
+            'winning_model': int(np.argmin(np.mean(pbic_b_30, axis=0)) + 1),
             'five_edge_controls': {
                 'canonical_M4_PCC_dB': float(np.mean(mse_b_5edge['Model_4_PCC'])),
                 'canonical_M2_LP_dB': float(np.mean(mse_b_5edge['Model_2_LP'])),
@@ -348,8 +352,10 @@ def run_step4(context_step1, data_path='data/external_adhd_timeseries_40.pkl'):
         'tdc_controls_n20': {
             'mean_mse_dB': np.mean(mse_b_7[:20], axis=0).tolist(),
             'linear_mean_mse': np.mean(mse_b_7_lin[:20], axis=0).tolist(),
-            'mean_pBIC': np.mean(pbic_b[:20], axis=0).tolist(),
-            'winning_model': int(np.argmin(np.mean(pbic_b[:20], axis=0)) + 1)
+            'mean_pBIC': np.mean(pbic_b_30[:20], axis=0).tolist(),
+            'mean_pBIC_30': np.mean(pbic_b_30[:20], axis=0).tolist(),
+            'mean_pBIC_480': np.mean(pbic_b_480[:20], axis=0).tolist(),
+            'winning_model': int(np.argmin(np.mean(pbic_b_30[:20], axis=0)) + 1)
         }
     }
 

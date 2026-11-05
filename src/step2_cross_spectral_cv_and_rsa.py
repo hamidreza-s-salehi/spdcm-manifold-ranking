@@ -405,9 +405,13 @@ def run_step2(context_step1):
     mean_k_l1 = float(np.mean(np.sum(np.abs(l1_coefs) > 1e-4, axis=1)))
 
     # 5-fold CV for L1 baseline on consensus CSD scale
+    # (Evaluating both unconstrained k_ext ~= 9.03 and degree-matched top-5 k_ext = 5.0)
     mse_lin_l1 = np.zeros(N_ibid)
     mse_dB_l1 = np.zeros(N_ibid)
     k_ret_l1 = np.zeros(N_ibid)
+
+    mse_lin_l1_5 = np.zeros(N_ibid)
+    mse_dB_l1_5 = np.zeros(N_ibid)
 
     for tr, te in kf_ibid.split(range(N_ibid)):
         clf = Lasso(alpha=0.01, fit_intercept=False, max_iter=2000, random_state=SEED)
@@ -416,32 +420,91 @@ def run_step2(context_step1):
         sparse_mask = np.abs(coefs) > 1e-4
         k_val = int(np.sum(sparse_mask))
 
+        # Unconstrained model
         A_proto_l1 = np.mean(A_ibid[tr, 0], axis=0).copy()
         A_proto_l1.flat[offdiag_indices[~sparse_mask]] = 0.0
         G_pred_l1 = biophysical_csd(A_proto_l1, freqs_ibid)
 
+        # Degree-matched k = 5.0 model (top-5 L1 edges by magnitude)
+        top5_idx = np.argsort(np.abs(coefs))[-5:]
+        sparse_mask_5 = np.zeros(30, dtype=bool)
+        sparse_mask_5[top5_idx] = True
+        A_proto_l1_5 = np.mean(A_ibid[tr, 0], axis=0).copy()
+        A_proto_l1_5.flat[offdiag_indices[~sparse_mask_5]] = 0.0
+        G_pred_l1_5 = biophysical_csd(A_proto_l1_5, freqs_ibid)
+
         for s in te:
+            # Unconstrained
             res = CSD_consensus[s] - G_pred_l1
             mse_lin = float(np.sum(np.abs(res)**2) / (N_f * 36))
             mse_lin_l1[s] = mse_lin
             mse_dB_l1[s] = float(10.0 * np.log10(mse_lin))
             k_ret_l1[s] = k_val
 
+            # Degree-matched k = 5
+            res_5 = CSD_consensus[s] - G_pred_l1_5
+            mse_lin_5 = float(np.sum(np.abs(res_5)**2) / (N_f * 36))
+            mse_lin_l1_5[s] = mse_lin_5
+            mse_dB_l1_5[s] = float(10.0 * np.log10(mse_lin_5))
+
+    # Metrics for unconstrained k_ext ~= 9.03
     pbic_l1 = N_eff * np.log(mse_lin_l1) + k_ret_l1 * np.log(N_eff)
     mean_pbic_l1_val = float(np.mean(pbic_l1))
+    sem_pbic_l1_val = float(np.std(pbic_l1, ddof=1) / np.sqrt(N_ibid))
     mean_mse_dB_l1_val = float(np.mean(mse_dB_l1))
+    sem_mse_dB_l1_val = float(np.std(mse_dB_l1, ddof=1) / np.sqrt(N_ibid))
+
+    w_dB_u, p_dB_u = wilcoxon(mse_dB_l1, ibid_models_7_gain[:, 3])
+    w_pbic_u, p_pbic_u = wilcoxon(pbic_l1, subject_pBIC[:, 3])
+
+    # Metrics for degree-matched k_ext = 5.0
+    pbic_l1_5 = N_eff * np.log(mse_lin_l1_5) + 5.0 * np.log(N_eff)
+    mean_pbic_l1_5_val = float(np.mean(pbic_l1_5))
+    sem_pbic_l1_5_val = float(np.std(pbic_l1_5, ddof=1) / np.sqrt(N_ibid))
+    mean_mse_dB_l1_5_val = float(np.mean(mse_dB_l1_5))
+    sem_mse_dB_l1_5_val = float(np.std(mse_dB_l1_5, ddof=1) / np.sqrt(N_ibid))
+
+    w_dB_5, p_dB_5 = wilcoxon(mse_dB_l1_5, ibid_models_7_gain[:, 3])
+    w_pbic_5, p_pbic_5 = wilcoxon(pbic_l1_5, subject_pBIC[:, 3])
 
     print(f"L1 Baseline: Runtime = {time_l1_seconds:.2f} s (vs Manifold {time_manifold_seconds*1e3:.1f} ms) | Mean k = {mean_k_l1:.1f}")
     print(f"L1 Baseline Retentions: PCC = {pcc_ret_pct:.1f}%, LP = {lp_ret_pct:.1f}%, Non-hub = {nh_ret_pct:.1f}%")
-    print(f"L1 Baseline CV MSE = {mean_mse_dB_l1_val:.2f} dB | pBIC = {mean_pbic_l1_val:.1f}")
+    print(f"L1 Baseline CV MSE (k ~ 9.03) = {mean_mse_dB_l1_val:.2f} +/- {sem_mse_dB_l1_val:.2f} dB | pBIC = {mean_pbic_l1_val:.1f} +/- {sem_pbic_l1_val:.1f}")
+    print(f"L1 Baseline CV MSE (k = 5.00) = {mean_mse_dB_l1_5_val:.2f} +/- {sem_mse_dB_l1_5_val:.2f} dB | pBIC = {mean_pbic_l1_5_val:.1f} +/- {sem_pbic_l1_5_val:.1f}")
 
-    de_novo_l1_baseline = {
+    linearized_l1_surrogate = {
         'computation_time_seconds': time_l1_seconds,
         'manifold_ranking_time_seconds': time_manifold_seconds,
         'mean_retained_edges': mean_k_l1,
         'pcc_outgoing_retention_rate_pct': pcc_ret_pct,
         'lp_outgoing_retention_rate_pct': lp_ret_pct,
         'nonhub_outgoing_retention_rate_pct': nh_ret_pct,
+        'unconstrained_k_9_03': {
+            'mean_retained_k': float(np.mean(k_ret_l1)),
+            'mean_mse_dB': mean_mse_dB_l1_val,
+            'sem_mse_dB': sem_mse_dB_l1_val,
+            'mean_pBIC': mean_pbic_l1_val,
+            'sem_pBIC': sem_pbic_l1_val,
+            'delta_mse_dB_relative_to_m4': float(mean_mse_dB_l1_val - np.mean(ibid_models_7_gain[:, 3])),
+            'delta_pBIC_relative_to_m4': float(mean_pbic_l1_val - mean_pbic[3]),
+            'wilcoxon_W_vs_m4_dB': float(w_dB_u),
+            'wilcoxon_p_value_vs_m4_dB': float(p_dB_u),
+            'wilcoxon_W_vs_m4_pBIC': float(w_pbic_u),
+            'wilcoxon_p_value_vs_m4_pBIC': float(p_pbic_u)
+        },
+        'degree_matched_k_5_0': {
+            'mean_retained_k': 5.0,
+            'mean_mse_dB': mean_mse_dB_l1_5_val,
+            'sem_mse_dB': sem_mse_dB_l1_5_val,
+            'mean_pBIC': mean_pbic_l1_5_val,
+            'sem_pBIC': sem_pbic_l1_5_val,
+            'delta_mse_dB_relative_to_m4': float(mean_mse_dB_l1_5_val - np.mean(ibid_models_7_gain[:, 3])),
+            'delta_pBIC_relative_to_m4': float(mean_pbic_l1_5_val - mean_pbic[3]),
+            'wilcoxon_W_vs_m4_dB': float(w_dB_5),
+            'wilcoxon_p_value_vs_m4_dB': float(p_dB_5),
+            'wilcoxon_W_vs_m4_pBIC': float(w_pbic_5),
+            'wilcoxon_p_value_vs_m4_pBIC': float(p_pbic_5)
+        },
         'five_fold_cv_mse_dB': mean_mse_dB_l1_val,
         'five_fold_cv_mse_linear': float(np.mean(mse_lin_l1)),
         'mean_pBIC': mean_pbic_l1_val,
@@ -547,7 +610,8 @@ def run_step2(context_step1):
         },
         'rsa_permutation_null_distribution': rsa_null_results,
         'ar_csd_vs_welch_csd_subspace_concordance': ar_welch_concordance,
-        'de_novo_l1_sparse_dcm_baseline': de_novo_l1_baseline,
+        'de_novo_l1_sparse_dcm_baseline': linearized_l1_surrogate,
+        'linearized_l1_spectral_surrogate': linearized_l1_surrogate,
         'cross_spectral_explained_variance_distribution': r2_distributions
     }
 

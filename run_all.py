@@ -131,7 +131,9 @@ def main():
         print(f"    - PCC Hub Outgoing SD:     {audit_disp['pcc_outgoing_sd_Hz']['mean']:.4f} Hz")
         print(f"    - LP Hub Outgoing SD:      {audit_disp['lp_outgoing_sd_Hz']['mean']:.4f} Hz")
         print(f"    - Non-Hub Off-Diagonal SD: {audit_disp['nonhub_outgoing_sd_Hz']['mean']:.4f} Hz")
-        print(f"    - Mann-Whitney Test (PCC vs Non-Hub): U = {audit_disp['statistical_comparisons']['pcc_vs_nonhub_mann_whitney_U']:.1f}, p = {audit_disp['statistical_comparisons']['pcc_vs_nonhub_p_value']:.4f}")
+        stat_pcc = audit_disp['statistical_comparisons']
+        print(f"    - PCC vs Non-Hub: U = {stat_pcc['pcc_vs_nonhub_mann_whitney_U']:.1f}, p = {stat_pcc['pcc_vs_nonhub_p_value']:.4f}, d = {stat_pcc['pcc_vs_nonhub_cohens_d']:+.3f}, 95% CI [{stat_pcc['pcc_vs_nonhub_ci95_bootstrap'][0]:+.4f}, {stat_pcc['pcc_vs_nonhub_ci95_bootstrap'][1]:+.4f}]")
+        print(f"    - LP vs Non-Hub:  U = {stat_pcc['lp_vs_nonhub_mann_whitney_U']:.1f}, p = {stat_pcc['lp_vs_nonhub_p_value']:.4f}, d = {stat_pcc['lp_vs_nonhub_cohens_d']:+.3f}, 95% CI [{stat_pcc['lp_vs_nonhub_ci95_bootstrap'][0]:+.4f}, {stat_pcc['lp_vs_nonhub_ci95_bootstrap'][1]:+.4f}]")
         print(f"    - Top-2 Ranking Preservation: M4 / M2 retained across Standard Deviation, Robust MAD, Isotropic, Precision scalings.")
     
     # 2. Family BMS & PEB+BMA Shrinkage
@@ -139,18 +141,29 @@ def main():
     peb_bma = res1['primary_ibid_bayesian_adjudication'].get('second_level_peb_bma_shrinkage', {})
     if fam_bms and peb_bma:
         print("\n[2] FAMILY-WISE BMS & PEB+BMA EMPIRICAL SHRINKAGE:")
-        print(f"    - Family-Wise RFX-BMS: Laplace XP = {fam_bms['laplace_free_energy']['family_exceedance_probability']} (Dominant: {fam_bms['laplace_free_energy']['winning_family']})")
-        print(f"    - Calibrated BMR XP:   {fam_bms['calibrated_bmr']['family_exceedance_probability']} (Dominant: {fam_bms['calibrated_bmr']['winning_family']})")
+        if 'uniform_model_priors' in fam_bms and 'balanced_equal_family_priors' in fam_bms:
+            u_xp = fam_bms['uniform_model_priors']['laplace_free_energy']['family_exceedance_probability']
+            b_xp = fam_bms['balanced_equal_family_priors']['laplace_free_energy']['family_exceedance_probability']
+            print(f"    - Family-Wise RFX-BMS (Uniform Model Priors):  Laplace XP = {u_xp} (Dominant: {fam_bms['uniform_model_priors']['laplace_free_energy']['winning_family']})")
+            print(f"    - Family-Wise RFX-BMS (Balanced Family Priors): Laplace XP = {b_xp} (Dominant: {fam_bms['balanced_equal_family_priors']['laplace_free_energy']['winning_family']})")
+        else:
+            print(f"    - Family-Wise RFX-BMS: Laplace XP = {fam_bms['laplace_free_energy']['family_exceedance_probability']} (Dominant: {fam_bms['laplace_free_energy']['winning_family']})")
         print(f"    - PEB+BMA Edge Retention (Pp > 0.95): {peb_bma['model_averaged_inclusion_probability']['retained_edges_Pp_gt_095']}/{peb_bma['model_averaged_inclusion_probability']['total_extrinsic_edges']} edges retained (all 30 dense connections survive)")
         
-    # 3. De Novo L1-Sparse DCM & R^2 Distribution
-    l1_base = res2['primary_ibid_predictive_cv_and_rsa'].get('de_novo_l1_sparse_dcm_baseline', {})
+    # 3. De Novo L1-Sparse DCM / Linearized Surrogate & R^2 Distribution
+    l1_base = res2['primary_ibid_predictive_cv_and_rsa'].get('linearized_l1_spectral_surrogate', res2['primary_ibid_predictive_cv_and_rsa'].get('de_novo_l1_sparse_dcm_baseline', {}))
     r2_ibid = res2['primary_ibid_predictive_cv_and_rsa'].get('cross_spectral_explained_variance_distribution', {})
     if l1_base:
-        print("\n[3] DE NOVO L1-SPARSE SPECTRAL DCM / rDCM BASELINE (IBID N = 58):")
+        print("\n[3] LINEARIZED L1-SPARSE SPECTRAL SURROGATE BASELINE (IBID N = 58):")
         print(f"    - Runtime: L1 Solver = {l1_base['computation_time_seconds']:.2f} s vs Post-Hoc Manifold = {l1_base['manifold_ranking_time_seconds']*1e3:.1f} ms")
         print(f"    - Edge Retentions: PCC = {l1_base['pcc_outgoing_retention_rate_pct']:.1f}%, LP = {l1_base['lp_outgoing_retention_rate_pct']:.1f}%, Non-Hub = {l1_base['nonhub_outgoing_retention_rate_pct']:.1f}%")
-        print(f"    - Predictive 5-Fold CV Error: {l1_base['five_fold_cv_mse_dB']:.2f} dB | pBIC = {l1_base['mean_pBIC']:.1f}")
+        if 'unconstrained_k_9_03' in l1_base:
+            u_k = l1_base['unconstrained_k_9_03']
+            m_5 = l1_base['degree_matched_k_5_0']
+            print(f"    - Unconstrained (k ~= 9.03): {u_k['mean_mse_dB']:.2f} +/- {u_k['sem_mse_dB']:.2f} dB | pBIC = {u_k['mean_pBIC']:.1f} +/- {u_k['sem_pBIC']:.1f} (vs M4 W={u_k['wilcoxon_W_vs_m4_dB']:.0f}, p={u_k['wilcoxon_p_value_vs_m4_dB']:.2e})")
+            print(f"    - Degree-Matched (k = 5.00): {m_5['mean_mse_dB']:.2f} +/- {m_5['sem_mse_dB']:.2f} dB | pBIC = {m_5['mean_pBIC']:.1f} +/- {m_5['sem_pBIC']:.1f} (vs M4 W={m_5['wilcoxon_W_vs_m4_dB']:.0f}, p={m_5['wilcoxon_p_value_vs_m4_dB']:.3f})")
+        else:
+            print(f"    - Predictive 5-Fold CV Error: {l1_base['five_fold_cv_mse_dB']:.2f} dB | pBIC = {l1_base['mean_pBIC']:.1f}")
     if r2_ibid:
         print("    - Cross-Spectral Explained Variance R^2 (IBID N = 58):")
         for m_k in ['Model_1', 'Model_2', 'Model_4']:

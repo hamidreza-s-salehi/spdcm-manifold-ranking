@@ -266,13 +266,17 @@ def compute_second_level_peb(X_cohort, qC_within):
     }
 
 
-def run_rfx_bms(F):
+def run_rfx_bms(F, alpha0=None):
     """
-    Random-Effects Bayesian Model Selection (RFX-BMS; Rigoux et al., 2014).
+    Random-Effects Bayesian Model Selection (RFX-BMS; Rigoux et al., 2014; Penny et al., 2010).
     Treats individual model attribution as a multinomial latent variable governed by Dirichlet distribution.
+    Supports arbitrary prior Dirichlet parameters alpha0 (e.g. uniform model priors or balanced family priors).
     """
     N, M = F.shape
-    alpha0 = np.ones(M)
+    if alpha0 is None:
+        alpha0 = np.ones(M)
+    else:
+        alpha0 = np.asarray(alpha0, dtype=float)
     alpha = alpha0.copy()
     
     for _ in range(100):
